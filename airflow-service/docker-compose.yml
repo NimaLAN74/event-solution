@@ -1,0 +1,24 @@
+name: airflow-simple
+
+services:
+  airflow:
+    image: apache/airflow:latest
+    container_name: airflow
+    ports:
+      - "8080:8080"
+    environment:
+      # Run as airflow user (matches official image default)
+      AIRFLOW_UID: ${AIRFLOW_UID:-50000}
+      AIRFLOW_HOME: /opt/airflow
+      # Keep it minimal: SQLite + no example DAGs
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+    volumes:
+      # Persist the whole Airflow home (DB, password file, logs, dags, plugins)
+      - ./airflow-home:/opt/airflow
+    command: >
+      bash -lc "
+        set -e;
+        mkdir -p /opt/airflow/dags /opt/airflow/logs /opt/airflow/plugins;
+        exec airflow standalone
+      "
+    restart: unless-stopped
