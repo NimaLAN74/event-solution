@@ -4,8 +4,15 @@ volumes:
   pg_data: {}
   secrets_cache: {}
 
+networks:
+  airflow_net:
+    name: airflow_net
+    external: true
+  infra_net:
+    name: infra_net
+    external: true
+
 services:
-  # ---------- Postgres (Airflow metadata DB) ----------
   postgres:
     image: postgres:17
     container_name: airflow-postgres
@@ -25,8 +32,8 @@ services:
       retries: 20
     networks:
       - airflow_net
+      - infra_net
 
-  # ---------- Init Secrets (one-time) ----------
   init-secrets:
     image: postgres:17
     container_name: airflow-init-secrets
@@ -46,8 +53,8 @@ services:
     restart: "no"
     networks:
       - airflow_net
+      - infra_net
 
-  # ---------- Airflow (LocalExecutor) ----------
   airflow:
     image: apache/airflow:latest
     container_name: airflow
@@ -63,46 +70,51 @@ services:
       AIRFLOW_HOME: /opt/airflow
       AIRFLOW__CORE__LOAD_EXAMPLES: "False"
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
-
-      # Newline-safe _CMD secrets (use printf, not echo)
+      AIRFLOW__CORE__STORE_SERIALIZED_DAGS: "True"
+      AIRFLOW__CORE__MIN_SERIALIZED_DAG_UPDATE_INTERVAL: "5"
+      AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: "10"
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN_CMD: >
         bash -lc 'printf %s "postgresql+psycopg2://airflow:$(cat /run/secrets/postgres_password)@postgres:5432/airflow"'
       AIRFLOW__CORE__FERNET_KEY_CMD: >
         bash -lc 'printf %s "$(cat /run/airflow-secrets/fernet_key)"'
       AIRFLOW__API__SECRET_KEY_CMD: >
         bash -lc 'printf %s "$(cat /run/airflow-secrets/webserver_secret_key)"'
-
-      # Simple Auth Manager uses a passwords file we generate at start (no creds in env)
       AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_PASSWORDS_FILE: "/opt/airflow/simple_auth_manager_passwords.json"
     volumes:
-      - ./airflow-home:/opt/airflow
+      - ./airflow-home/dags:/opt/airflow/dags
+      - ./airflow-home/logs:/opt/airflow/logs
+      - ./airflow-home/plugins:/opt/airflow/plugins
       - ./secrets/postgres_password.txt:/run/secrets/postgres_password:ro
       - secrets_cache:/run/airflow-secrets:ro
-    command: >
-      bash -lc "
-        set -euo pipefail;
+    command: |
+      bash -lc '
+        set -euo pipefail
 
-        mkdir -p /opt/airflow/dags /opt/airflow/logs /opt/airflow/plugins;
+        mkdir -p /opt/airflow/dags /opt/airflow/logs /opt/airflow/plugins
 
-        # Create SimpleAuth file from init-secrets outputs
-        ADMIN_USER=$(cat /run/airflow-secrets/admin_user 2>/dev/null || echo admin)
-        ADMIN_PASS=$(cat /run/airflow-secrets/admin_password)
-        if [ ! -f /opt/airflow/simple_auth_manager_passwords.json ]; then
-          printf '{\"%s\":\"%s\"}\n' \"$ADMIN_USER\" \"$ADMIN_PASS\" > /opt/airflow/simple_auth_manager_passwords.json;
-          chmod 600 /opt/airflow/simple_auth_manager_passwords.json || true;
+        # Read admin creds produced by init-secrets
+        ADMIN_USER="$(tr -d "\n" < /run/airflow-secrets/admin_user || true)"
+        ADMIN_PASS="$(tr -d "\n" < /run/airflow-secrets/admin_password || true)"
+
+        if [ -z "$${ADMIN_USER}" ] || [ -z "$${ADMIN_PASS}" ]; then
+          echo "ERROR: /run/airflow-secrets/admin_user or admin_password missing"
+          ls -lah /run/airflow-secrets || true
+          exit 1
         fi
 
-        # Init/upgrade DB and run components
-        airflow db migrate;
+        # Write the SimpleAuth file (single-line JSON)
+        printf "{\"%s\":\"%s\"}" "$${ADMIN_USER}" "$${ADMIN_PASS}" > /opt/airflow/simple_auth_manager_passwords.json
+        chmod 600 /opt/airflow/simple_auth_manager_passwords.json || true
+
+        # DB migrate and start services (Airflow 3)
+        airflow db migrate
+        airflow dag-processor &
         airflow scheduler &
         airflow triggerer &
 
         exec airflow api-server --port 8080
-      "
+      '
     restart: unless-stopped
     networks:
       - airflow_net
-
-networks:
-  airflow_net:
-    external: true
+      - infra_net
