@@ -1,0 +1,33 @@
+name: infra-service
+
+volumes:
+  nginx_certs: {}
+
+services:
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: infra-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - nginx_certs:/etc/nginx/certs
+    networks:
+      - airflow_net
+    command: >
+      sh -lc '
+        if [ ! -f /etc/nginx/certs/selfsigned.key ]; then
+          apk add --no-cache openssl >/dev/null 2>&1;
+          openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+            -keyout /etc/nginx/certs/selfsigned.key \
+            -out /etc/nginx/certs/selfsigned.crt \
+            -subj "/CN=localhost";
+        fi;
+        nginx -g "daemon off;";
+      '
+    restart: unless-stopped
+
+networks:
+  airflow_net:
+    external: true

@@ -1,24 +1,108 @@
-name: airflow-simple
+name: airflow-service
+
+volumes:
+  pg_data: {}
+  secrets_cache: {}
 
 services:
+  # ---------- Postgres (Airflow metadata DB) ----------
+  postgres:
+    image: postgres:17
+    container_name: airflow-postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_DB: airflow
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./secrets/postgres_password.txt:/run/secrets/postgres_password:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow -d airflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks:
+      - airflow_net
+
+  # ---------- Init Secrets (one-time) ----------
+  init-secrets:
+    image: postgres:17
+    container_name: airflow-init-secrets
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGUSER: airflow
+      PGDATABASE: airflow
+      PGPASSWORD_FILE: /run/secrets/postgres_password
+    volumes:
+      - ./secrets/postgres_password.txt:/run/secrets/postgres_password:ro
+      - secrets_cache:/secrets_out
+      - ./scripts/init-secrets.sh:/docker-entrypoint-initdb.d/99-init-secrets.sh:ro
+    entrypoint: [ "bash", "-lc", "/docker-entrypoint-initdb.d/99-init-secrets.sh" ]
+    restart: "no"
+    networks:
+      - airflow_net
+
+  # ---------- Airflow (LocalExecutor) ----------
   airflow:
     image: apache/airflow:latest
     container_name: airflow
+    depends_on:
+      postgres:
+        condition: service_healthy
+      init-secrets:
+        condition: service_completed_successfully
     ports:
       - "8080:8080"
     environment:
-      # Run as airflow user (matches official image default)
-      AIRFLOW_UID: ${AIRFLOW_UID:-50000}
+      AIRFLOW_UID: "50000"
       AIRFLOW_HOME: /opt/airflow
-      # Keep it minimal: SQLite + no example DAGs
       AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+
+      # Newline-safe _CMD secrets (use printf, not echo)
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN_CMD: >
+        bash -lc 'printf %s "postgresql+psycopg2://airflow:$(cat /run/secrets/postgres_password)@postgres:5432/airflow"'
+      AIRFLOW__CORE__FERNET_KEY_CMD: >
+        bash -lc 'printf %s "$(cat /run/airflow-secrets/fernet_key)"'
+      AIRFLOW__API__SECRET_KEY_CMD: >
+        bash -lc 'printf %s "$(cat /run/airflow-secrets/webserver_secret_key)"'
+
+      # Simple Auth Manager uses a passwords file we generate at start (no creds in env)
+      AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_PASSWORDS_FILE: "/opt/airflow/simple_auth_manager_passwords.json"
     volumes:
-      # Persist the whole Airflow home (DB, password file, logs, dags, plugins)
       - ./airflow-home:/opt/airflow
+      - ./secrets/postgres_password.txt:/run/secrets/postgres_password:ro
+      - secrets_cache:/run/airflow-secrets:ro
     command: >
       bash -lc "
-        set -e;
+        set -euo pipefail;
+
         mkdir -p /opt/airflow/dags /opt/airflow/logs /opt/airflow/plugins;
-        exec airflow standalone
+
+        # Create SimpleAuth file from init-secrets outputs
+        ADMIN_USER=$(cat /run/airflow-secrets/admin_user 2>/dev/null || echo admin)
+        ADMIN_PASS=$(cat /run/airflow-secrets/admin_password)
+        if [ ! -f /opt/airflow/simple_auth_manager_passwords.json ]; then
+          printf '{\"%s\":\"%s\"}\n' \"$ADMIN_USER\" \"$ADMIN_PASS\" > /opt/airflow/simple_auth_manager_passwords.json;
+          chmod 600 /opt/airflow/simple_auth_manager_passwords.json || true;
+        fi
+
+        # Init/upgrade DB and run components
+        airflow db migrate;
+        airflow scheduler &
+        airflow triggerer &
+
+        exec airflow api-server --port 8080
       "
     restart: unless-stopped
+    networks:
+      - airflow_net
+
+networks:
+  airflow_net:
+    external: true
